@@ -67,6 +67,73 @@ To get your API key:
 
 
 ----------------------------------------------------------------
+## Job registry and job-linked camera evidence (Phase 4, staged implementation)
+
+The **Jobs** view lets an operator register a draft job against a machine
+already known to camera monitoring. FDM printers, CNC machines, and laser
+cutters expose different intended-parameter fields. A job may optionally
+include a G-code/NC file; uploaded files are parsed as untrusted UTF-8 text,
+stored outside the public web root, and never executed or sent to hardware.
+The upload limit is 2 MiB. The parser reports recognized command and metadata
+summaries, flags unsupported commands for review, and does not infer actual
+machine progress, material usage, or sensor readings from program text.
+
+Job lifecycle states are `DRAFT`, `READY`, `RUNNING`, `PAUSED`, `COMPLETED`,
+`FAILED`, and `CANCELLED`. A machine cannot have more than one `RUNNING` or
+`PAUSED` job at once. Lifecycle buttons record operator-managed state only;
+they do not start monitoring or issue physical machine commands.
+
+The initial job APIs are:
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/jobs` | Paginated job list with optional `machine_id` and `status` filters. |
+| `POST /api/jobs` | Create an assigned draft job. |
+| `GET /api/jobs/:id` | Read job data and parsed G-code summary. |
+| `PATCH /api/jobs/:id` | Edit a draft or ready job. |
+| `POST /api/jobs/:id/gcode?filename=...` | Validate and store G-code/NC text. |
+| `GET /api/jobs/:id/history` | Paginated valid camera analyses linked to that job. |
+| `GET /api/jobs/:id/insights` | Valid observation summary, repeated-failure deviations, and explicit unavailable progress/telemetry status. |
+| `POST /api/deviations/:id/acknowledge` | Acknowledge an active deviation with optional operator notes. |
+| `POST /api/deviations/:id/resolve` | Resolve an active or acknowledged deviation. |
+| `POST /api/deviations/:id/investigate` | Request a validated, evidence-cited root-cause report. |
+| `GET/POST /api/jobs/:id/comparison` | Read or create a persisted evidence comparison. |
+| `GET/POST /api/jobs/:id/completion-verifications` | Read verification history, evaluate evidence, or record separate operator confirmation. |
+| `POST /api/jobs/:id/transition` | Request a validated job lifecycle transition. |
+
+Migrations `004_jobs_and_gcode.sql` and `005_job_analysis_link.sql` add job
+storage and a nullable job reference to camera history without rewriting
+Phase 1 or Phase 2 records. Migration `006_job_deviations.sql` adds persistent
+job-deviation storage. Migration `007_job_intelligence_lifecycle.sql`
+transactionally preserves existing deviation IDs/evidence while adding
+acknowledgment, resolution, lifecycle history, root-cause report, comparison,
+and completion-verification storage. While a job is RUNNING or PAUSED, camera analysis
+requests include its operator-provided intent and parsed summary as context;
+valid results and invalid audit attempts are linked to that job. Program
+contents are not sent to the vision provider or included in WebSocket events.
+This association does not establish progress or physical execution.
+
+Repeated camera failures are reported only after the same failure category
+appears in at least two valid warning/failure analyses within six hours, each
+with confidence >= 0.70 and abnormality >= 60. The deviation includes its
+supporting observation IDs, timestamps, scores, and confidences, and is
+deduplicated per active job/category. It is not automatically resolved.
+Operators can acknowledge or resolve deviations; transitions and optional notes
+are persisted, duplicate transitions are rejected, and original evidence is
+preserved. Root-cause reports separate database-backed observed facts from
+unconfirmed AI hypotheses and reuse reports for unchanged evidence. Provider
+errors are recorded without interrupting camera monitoring.
+
+Expected-vs-actual comparisons use valid camera results and clearly label
+inferred visual values versus measured telemetry. Missing sensor values produce
+`NOT_MEASURABLE`, not a fabricated deviation. Completion verification is stored
+separately from lifecycle state: recent visible printing may show
+`NOT_COMPLETE`, an operator confirmation after lifecycle completion may show
+`LIKELY_COMPLETE`, and missing evidence remains `COMPLETION_UNCERTAIN`.
+`VERIFIED_COMPLETE` is not currently emitted because the application has no
+independent controller-completion telemetry. Neither elapsed duration nor
+G-code proves physical completion.
+
 ## Alerts
 
 Watch Guard can message you on Discord when something goes wrong, so you do not
@@ -160,6 +227,51 @@ A rejected webhook comes back with the reason Discord gave.
 
 See `.env.example` for every setting, including snapshot attachments, cooldowns,
 and the bot's display name.
+
+----------------------------------------------------------------
+## Vision OPS Manufacturing Copilot
+
+The floating **AI Copilot** panel is available on every dashboard view. It can
+summarize machine health, camera trends, sensor readings, incidents, warnings,
+and job intelligence from persisted SQLite records. Choose a machine in the
+panel or use **All machines**. Suggested prompts, conversation history, retry
+feedback, and clear/new-chat controls are included.
+
+The Copilot reuses the active `AI_PROVIDER`, model, and credentials already
+configured for camera analysis. It has no separate key or model setting.
+Requests are read-only with respect to machines, jobs, incidents, and warnings;
+only Copilot conversation records are written. It cannot control a machine,
+change job state, acknowledge an incident, or edit G-code.
+
+Answers use bounded, relevant database context. Sensor evidence retains
+REAL/SIMULATED provenance, missing or stale data is not treated as normal, and
+job/G-code intent is not described as measured progress. Evidence references
+and timestamps are shown below assistant responses. If evidence is insufficient,
+the assistant is instructed to say so.
+
+Migration `010_manufacturing_copilot.sql` adds the conversation and message
+tables. Conversations are scoped to a random HttpOnly, SameSite=Strict browser
+cookie, so separate browser sessions do not see each other's history. This is
+**browser-session isolation, not user authentication**: the existing app has no
+login/account ownership system. Do not expose an unauthenticated deployment to
+untrusted users or treat the cookie as account-level authorization.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/copilot/health` | Reports whether the active provider is configured; returns no credentials. |
+| `GET /api/copilot/conversations` | Lists this browser session's conversations. |
+| `POST /api/copilot/conversations` | Creates an empty conversation. |
+| `GET /api/copilot/conversations/:id` | Retrieves an owned conversation and messages. |
+| `DELETE /api/copilot/conversations/:id` | Deletes an owned conversation and its messages. |
+| `DELETE /api/copilot/conversations/:id/messages` | Clears messages but retains the conversation. |
+| `POST /api/copilot/chat` | Answers a validated question using persisted context and bounded history. |
+
+Messages are limited to 2,000 characters, provider requests time out after 25
+seconds, history is limited to 12 messages, and the per-browser-session rate
+limit is 12 requests per five minutes. Report requests return an
+evidence-based response in the conversation; no downloadable report file is
+generated. The Copilot is not a certified diagnostic system and does not
+establish real-world prediction accuracy.
 
 ----------------------------------------------------------------
 ## Troubleshooting

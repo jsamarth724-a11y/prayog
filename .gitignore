@@ -6,6 +6,9 @@
 # Dependencies
 node_modules/
 
+# Local SQLite database and write-ahead logs
+data/
+
 # Logs
 npm-debug.log*
 

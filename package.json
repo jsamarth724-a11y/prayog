@@ -6,12 +6,18 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "dev": "node --watch server.mjs"
+    "dev": "node --watch server.mjs",
+    "test": "node --test tests/phase1.test.mjs tests/phase2.test.mjs tests/phase4.test.mjs tests/phase5.test.mjs tests/phase6.test.mjs tests/copilot.test.mjs"
   },
   "dependencies": {
+    "better-sqlite3": "^13.0.3",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "groq-sdk": "^1.3.0",
     "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
   }
 }

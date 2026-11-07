@@ -1,9 +1,69 @@
-import "dotenv/config";
+import dotenv from "dotenv";
+import { createHash } from "node:crypto";
 import fs from "fs";
 import path from "path";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import Groq from "groq-sdk";
 import { WebSocketServer } from "ws";
+import { classifyProviderError } from "./ai/errors.mjs";
+import { createCopilotRouter } from "./ai/copilot.mjs";
+import { createProductQualityRouter } from "./quality/api.mjs";
+import {
+  MAX_GCODE_BYTES,
+  parseGcode,
+  validateGcodeFilename,
+} from "./jobs/gcode.mjs";
+import {
+  createJob,
+  findActiveJobForMachine,
+  getJobAnalysisHistory,
+  getJobAnalysisHistoryForInsights,
+  getJob,
+  listJobs,
+  saveJobFile,
+  transitionJob,
+  updateJob,
+} from "./jobs/repository.mjs";
+import {
+  detectJobDeviations,
+  getJobInsights,
+  persistJobDeviations,
+} from "./jobs/insights.mjs";
+import {
+  buildRootCausePrompt,
+  validateRootCauseResponse,
+} from "./jobs/root-cause.mjs";
+import {
+  compareJobEvidence,
+  completeRootCauseReport,
+  evaluateCompletionVerification,
+  failRootCauseReport,
+  listJobComparisons,
+  persistCompletionVerification,
+  persistJobComparison,
+  reserveRootCauseReport,
+  transitionDeviation,
+} from "./jobs/intelligence.mjs";
+import { getDatabase, initializeDatabase } from "./db/database.mjs";
+import {
+  findMachine,
+  getValidAnalysisHistory,
+  getValidTrendRecords,
+  listMachines,
+  listMachineWarnings,
+  persistInvalidAnalysis,
+  persistValidAnalysis,
+  registerMachine,
+  transitionWarning,
+  upsertEarlyWarning,
+} from "./db/repository.mjs";
+import { getTrendConfig } from "./trend/config.mjs";
+import { analyzeTrend, evaluateEarlyWarnings, publicTrendResult } from "./trend/engine.mjs";
+import { createSensorRouter } from "./sensors/api.mjs";
+import { fuseMachineContext, getSensorFusionConfig } from "./sensors/fusion.mjs";
+import { listSensors } from "./sensors/repository.mjs";
+import { createSimulationRouter, createSimulationService } from "./sensors/simulation.mjs";
 import {
 alertLevel,
 describeNotifications,
@@ -17,23 +77,232 @@ notifyRoutine,
 notifyTest,
 notifyWarning,
 } from "./notifications.mjs";
+const PROJECT_ROOT = path.dirname(fileURLToPath(import.meta.url));
+const ENV_PATH = path.join(PROJECT_ROOT, ".env");
+const inheritedAiEnvironment = Object.fromEntries(
+  ["AI_PROVIDER", "GROQ_MODEL", "OPENROUTER_MODEL"].map((name) => [name, process.env[name]]),
+);
+const dotenvLoadResult = dotenv.config({ path: ENV_PATH });
+if (dotenvLoadResult.error && dotenvLoadResult.error.code !== "ENOENT") {
+  throw new Error(`Could not load the project environment file "${ENV_PATH}": ${dotenvLoadResult.error.message}`);
+}
 const app = express();
 const port = Number(process.env.PORT || 3001);
 const DEFAULT_GROQ_MODEL = "qwen/qwen3.8-27b";
 const DEFAULT_OPENROUTER_MODEL = "anthropic/claude-3.5-haiku";
-const ENV_PATH = path.resolve(process.cwd(), ".env");
+const MACHINE_UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isValidMachineId(value) {
+  return MACHINE_UUID_PATTERN.test(value);
+}
+
+function validJobInput(body, machine) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return { error: "A JSON object is required." };
+  }
+  const name = typeof body.name === "string" ? body.name.trim() : "";
+  if (!name || name.length > 100) return { error: "Job name must be 1–100 characters." };
+  if (!isValidMachineId(body.machine_id)) return { error: "Machine ID must be a UUID." };
+  const machineType = machine?.machine_type;
+  const parameterRules = {
+    "3d_printer": {
+      nozzle_temperature_c: [0, 350, false],
+      bed_temperature_c: [0, 150, false],
+      layer_height_mm: [0.01, 2, false],
+      expected_layer_count: [1, 1_000_000, true],
+    },
+    cnc: {
+      spindle_speed_rpm: [1, 100_000, false],
+      feed_rate_mm_min: [1, 100_000, false],
+      tool_identifier: ["string", 80],
+    },
+    laser_cutter: {
+      laser_power_percent: [0, 100, false],
+      cutting_speed_mm_min: [1, 100_000, false],
+    },
+  };
+  const rules = parameterRules[machineType];
+  if (!rules) return { error: "Jobs are supported only for 3D printers, CNC machines, and laser cutters." };
+  const expectedParameters = body.expected_parameters ?? {};
+  if (
+    !expectedParameters ||
+    typeof expectedParameters !== "object" ||
+    Array.isArray(expectedParameters)
+  ) {
+    return { error: "Expected parameters must be a JSON object." };
+  }
+  const normalizedParameters = {};
+  for (const [key, value] of Object.entries(expectedParameters)) {
+    const rule = rules[key];
+    if (!rule) return { error: `Parameter "${key}" is not supported for ${machineType}.` };
+    if (rule[0] === "string") {
+      if (typeof value !== "string" || !value.trim() || value.length > rule[1]) {
+        return { error: `${key} must be a non-empty string of at most ${rule[1]} characters.` };
+      }
+      normalizedParameters[key] = value.trim();
+      continue;
+    }
+    if (
+      typeof value !== "number" ||
+      !Number.isFinite(value) ||
+      value < rule[0] ||
+      value > rule[1] ||
+      (rule[2] && !Number.isInteger(value))
+    ) {
+      return { error: `${key} must be a valid number from ${rule[0]} to ${rule[1]}.` };
+    }
+    normalizedParameters[key] = value;
+  }
+  const duration = body.expected_duration_seconds ?? null;
+  if (
+    duration !== null &&
+    (!Number.isInteger(duration) || duration < 1 || duration > 100_000_000)
+  ) {
+    return { error: "Expected duration must be a positive number of seconds." };
+  }
+  const optionalString = (value, label, max) => {
+    if (value === undefined || value === null || value === "") return { value: null };
+    if (typeof value !== "string" || value.trim().length > max) {
+      return { error: `${label} must be at most ${max} characters.` };
+    }
+    return { value: value.trim() || null };
+  };
+  const jobType = optionalString(body.job_type, "Job type", 60);
+  const materialType = optionalString(body.material_type, "Material type", 80);
+  const operatorNotes = optionalString(body.operator_notes, "Operator notes", 1000);
+  for (const field of [jobType, materialType, operatorNotes]) {
+    if (field.error) return { error: field.error };
+  }
+  const metadata = body.slicer_metadata ?? {};
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return { error: "Slicer metadata must be a JSON object." };
+  }
+  const slicerMetadata = {};
+  const metadataEntries = Object.entries(metadata);
+  if (metadataEntries.length > 20) return { error: "Slicer metadata may contain at most 20 fields." };
+  for (const [key, value] of metadataEntries) {
+    if (!/^[a-zA-Z0-9_-]{1,50}$/.test(key)) return { error: "Slicer metadata contains an invalid key." };
+    if (typeof value === "string" && value.length <= 200) slicerMetadata[key] = value;
+    else if (typeof value === "number" && Number.isFinite(value)) slicerMetadata[key] = value;
+    else if (typeof value === "boolean") slicerMetadata[key] = value;
+    else return { error: `Slicer metadata "${key}" must be a short string, number, or boolean.` };
+  }
+  const machineTypeDefaults = {
+    "3d_printer": "3d_print",
+    cnc: "cnc_machining",
+    laser_cutter: "laser_cutting",
+  };
+  return {
+    value: {
+      name,
+      machineId: body.machine_id,
+      machineType,
+      jobType: jobType.value || machineTypeDefaults[machineType],
+      expectedDurationSeconds: duration,
+      materialType: materialType.value,
+      expectedParameters: normalizedParameters,
+      slicerMetadata,
+      operatorNotes: operatorNotes.value,
+    },
+  };
+}
+
+function jobInputForUpdate(body, existing) {
+  const patch = body && typeof body === "object" && !Array.isArray(body) ? body : {};
+  const patchValue = (key, fallback) => Object.hasOwn(patch, key) ? patch[key] : fallback;
+  const result = validJobInput(
+    {
+      ...patch,
+      name: patchValue("name", existing.name),
+      machine_id: existing.machine_id,
+      job_type: patchValue("job_type", existing.job_type),
+      expected_duration_seconds: patchValue("expected_duration_seconds", existing.expected_duration_seconds),
+      material_type: patchValue("material_type", existing.material_type),
+      expected_parameters: patchValue("expected_parameters", existing.expected_parameters),
+      slicer_metadata: patchValue("slicer_metadata", existing.slicer_metadata),
+      operator_notes: patchValue("operator_notes", existing.operator_notes),
+    },
+    existing,
+  );
+  if (!result.value) return result;
+  const { machineId: _machineId, machineType: _machineType, ...value } = result.value;
+  return { value };
+}
+
+function jobFileBody(request, response, next) {
+  const contentType = String(request.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+  if (!["text/plain", "application/gcode", "application/octet-stream"].includes(contentType)) {
+    return response.status(415).json({
+      error: { code: "unsupported_media_type", message: "Upload G-code as text/plain or application/gcode." },
+    });
+  }
+  express.raw({ type: contentType, limit: MAX_GCODE_BYTES })(request, response, (error) => {
+    if (!error) return next();
+    const tooLarge = error.status === 413 || error.type === "entity.too.large";
+    return response.status(tooLarge ? 413 : 400).json({
+      error: {
+        code: tooLarge ? "gcode_file_too_large" : "invalid_gcode_upload",
+        message: tooLarge
+          ? `G-code files may not exceed ${MAX_GCODE_BYTES} bytes.`
+          : "The G-code upload could not be read.",
+      },
+    });
+  });
+}
+
+function analyzeMachineHistory(database, machineId) {
+  const config = getTrendConfig();
+  const records = getValidTrendRecords(database, machineId);
+  return { config, records, trend: analyzeTrend(records, config) };
+}
+
+function warningResponse(warning) {
+  const evidence = warning.supporting_evidence || {};
+  return {
+    id: warning.id,
+    machine_id: warning.machine_id,
+    category: warning.category,
+    severity: warning.severity,
+    reason: warning.explanation,
+    supporting_observations: evidence.supporting_observations || [],
+    first_detected_timestamp: evidence.first_detected_at || warning.created_at,
+    latest_detected_timestamp: evidence.latest_detected_at || warning.updated_at,
+    recommended_operator_action: evidence.recommended_action || "Review the machine condition.",
+    state: warning.state,
+    created_at: warning.created_at,
+    updated_at: warning.updated_at,
+    acknowledged_at: warning.acknowledged_at,
+    resolved_at: warning.resolved_at,
+    operator_notes: warning.operator_notes,
+  };
+}
 
 let openrouterApiKey = (process.env.OPENROUTER_API_KEY || "").trim();
 let groqApiKey = (process.env.GROQ_API_KEY || "").trim();
 
-// Auto-detect provider: defaults to openrouter if OPENROUTER_API_KEY or AI_PROVIDER=openrouter is set
+function configuredValueSource(name) {
+  if (String(inheritedAiEnvironment[name] || "").trim()) return "process_environment";
+  if (String(dotenvLoadResult.parsed?.[name] || "").trim()) return "project_env_file";
+  return "default";
+}
+
 let provider = process.env.AI_PROVIDER || (openrouterApiKey ? "openrouter" : "groq");
+let providerSource = process.env.AI_PROVIDER
+  ? configuredValueSource("AI_PROVIDER")
+  : openrouterApiKey ? "auto_detected_openrouter_key" : "default_groq";
 let model = provider === "openrouter"
   ? (process.env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL)
   : (process.env.GROQ_MODEL || DEFAULT_GROQ_MODEL);
+let modelSource = configuredValueSource(provider === "openrouter" ? "OPENROUTER_MODEL" : "GROQ_MODEL");
 
 let groq = groqApiKey ? new Groq({ apiKey: groqApiKey }) : null;
 const requestTimeoutMs = Number(process.env.GROQ_TIMEOUT_MS || process.env.AI_TIMEOUT_MS || 25_000);
+console.info(
+  `[ai-config] provider=${provider} provider_source=${providerSource} model=${model} ` +
+  `model_source=${modelSource} project_env_loaded=${Boolean(dotenvLoadResult.parsed)} ` +
+  `active_key_configured=${provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groqApiKey)}`,
+);
 
 // Groq's free tier caps vision requests at 8000 tokens per minute. One 320px
 // frame fits; the moment the UI starts sending the previous frame as a
@@ -52,6 +321,54 @@ Number(error?.status) === 413 ||
 /request too large|tokens per minute|reduce your message size/i.test(message)
 );
 }
+const parseSensorJson = express.json({ limit: "4kb" });
+app.use(["/api/sensors", "/api/incidents"], (request, response, next) => {
+  parseSensorJson(request, response, (error) => {
+    if (!error) return next();
+    const tooLarge = Number(error.status) === 413;
+    console.warn("Rejected sensor API JSON body:", error.message);
+    return response.status(tooLarge ? 413 : 400).json({
+      error: {
+        code: tooLarge ? "sensor_payload_too_large" : "invalid_sensor_json",
+        message: tooLarge
+          ? "Sensor API JSON payload must not exceed 4 KB."
+          : "Sensor API request body must be valid JSON.",
+      },
+    });
+  });
+});
+const parseCopilotJson = express.json({ limit: "32kb" });
+app.use("/api/copilot", (request, response, next) => {
+  parseCopilotJson(request, response, (error) => {
+    if (!error) return next();
+    const tooLarge = Number(error.status) === 413;
+    console.warn("Rejected Copilot API JSON body:", error.message);
+    return response.status(tooLarge ? 413 : 400).json({
+      error: {
+        code: tooLarge ? "copilot_payload_too_large" : "invalid_copilot_json",
+        message: tooLarge
+          ? "Copilot API JSON payload must not exceed 32 KB."
+          : "Copilot API request body must be valid JSON.",
+      },
+    });
+  });
+});
+const parseQualityJson = express.json({ limit: "5mb" });
+app.use("/api/quality", (request, response, next) => {
+  parseQualityJson(request, response, (error) => {
+    if (!error) return next();
+    const tooLarge = Number(error.status) === 413;
+    console.warn("Rejected product quality API JSON body:", error.message);
+    return response.status(tooLarge ? 413 : 400).json({
+      error: {
+        code: tooLarge ? "quality_payload_too_large" : "invalid_quality_json",
+        message: tooLarge
+          ? "Product inspection uploads must fit within the 5 MiB request limit."
+          : "Product quality API request body must be valid JSON.",
+      },
+    });
+  });
+});
 app.use(express.json({ limit: "6mb" }));
 // No caching on static assets — this is a locally-run dev tool, and stale
 // cached JS after an update is far more confusing than a slightly slower
@@ -101,12 +418,892 @@ model,
 });
 });
 
+app.get("/api/machines", (_request, response) => {
+  try {
+    return response.json({ machines: listMachines(getDatabase()) });
+  } catch (error) {
+    console.error("Could not load machine overview:", error);
+    return response.status(500).json({
+      error: { code: "machines_unavailable", message: "Machine overview could not be loaded." },
+    });
+  }
+});
+
+app.get("/api/jobs", (request, response) => {
+  const machineId = request.query.machine_id;
+  const status = request.query.status;
+  const allowedStatuses = new Set([
+    "DRAFT", "READY", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED",
+  ]);
+  const limit = request.query.limit === undefined ? 50 : Number(request.query.limit);
+  const offset = request.query.offset === undefined ? 0 : Number(request.query.offset);
+  if (machineId !== undefined && !isValidMachineId(machineId)) {
+    return response.status(400).json({
+      error: { code: "invalid_machine_id", message: "Machine ID must be a UUID." },
+    });
+  }
+  if (status !== undefined && !allowedStatuses.has(status)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_status", message: "Job status is not recognized." },
+    });
+  }
+  if (!Number.isInteger(limit) || limit < 1 || !Number.isInteger(offset) || offset < 0) {
+    return response.status(400).json({
+      error: { code: "invalid_pagination", message: "Limit must be positive and offset non-negative." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    if (machineId && !findMachine(database, machineId)) {
+      return response.status(404).json({
+        error: { code: "machine_not_found", message: "No machine exists with that ID." },
+      });
+    }
+    return response.json({
+      jobs: listJobs(database, {
+        machineId: machineId || null,
+        status: status || null,
+        limit: Math.min(limit, 200),
+        offset,
+      }),
+      limit: Math.min(limit, 200),
+      offset,
+    });
+  } catch (error) {
+    console.error("Could not load jobs:", error);
+    return response.status(500).json({
+      error: { code: "jobs_unavailable", message: "Jobs could not be loaded." },
+    });
+  }
+});
+
+app.post("/api/jobs", (request, response) => {
+  if (!isValidMachineId(request.body?.machine_id)) {
+    return response.status(400).json({
+      error: { code: "invalid_machine_id", message: "Machine ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const machine = findMachine(database, request.body.machine_id);
+    if (!machine) {
+      return response.status(404).json({
+        error: { code: "machine_not_found", message: "No machine exists with that ID." },
+      });
+    }
+    const validated = validJobInput(request.body, machine);
+    if (validated.error) {
+      return response.status(400).json({
+        error: { code: "invalid_job", message: validated.error },
+      });
+    }
+    const result = createJob(database, validated.value);
+    if (result.reason === "machine_not_found") {
+      return response.status(404).json({
+        error: { code: "machine_not_found", message: "No machine exists with that ID." },
+      });
+    }
+    if (result.reason === "machine_type_mismatch") {
+      return response.status(409).json({
+        error: { code: "machine_type_mismatch", message: "Job type must match the registered machine type." },
+      });
+    }
+    broadcast({ type: "job_created", machineId: result.job.machine_id, job: result.job });
+    return response.status(201).json({ job: result.job });
+  } catch (error) {
+    console.error("Could not create job:", error);
+    return response.status(500).json({
+      error: { code: "job_create_failed", message: "The job could not be created." },
+    });
+  }
+});
+
+app.get("/api/jobs/:id", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  try {
+    const job = getJob(getDatabase(), jobId);
+    if (!job) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    return response.json({ job });
+  } catch (error) {
+    console.error("Could not load job:", error);
+    return response.status(500).json({
+      error: { code: "job_unavailable", message: "The job could not be loaded." },
+    });
+  }
+});
+
+function validOperatorNotes(body) {
+  if (!body || body.operator_notes === undefined || body.operator_notes === null) {
+    return { value: null };
+  }
+  if (typeof body.operator_notes !== "string" || body.operator_notes.length > 1000) {
+    return { error: "Operator notes must be a string no longer than 1000 characters." };
+  }
+  return { value: body.operator_notes.trim() || null };
+}
+
+function handleDeviationTransition(action) {
+  return (request, response) => {
+    const deviationId = request.params.id;
+    if (!isValidMachineId(deviationId)) {
+      return response.status(400).json({
+        error: { code: "invalid_deviation_id", message: "Deviation ID must be a UUID." },
+      });
+    }
+    const notes = validOperatorNotes(request.body);
+    if (notes.error) {
+      return response.status(400).json({
+        error: { code: "invalid_operator_notes", message: notes.error },
+      });
+    }
+    try {
+      const database = getDatabase();
+      const result = transitionDeviation(database, deviationId, action, notes.value);
+      if (result.reason === "deviation_not_found") {
+        return response.status(404).json({
+          error: { code: "deviation_not_found", message: "No deviation exists with that ID." },
+        });
+      }
+      if (result.reason === "invalid_transition") {
+        return response.status(409).json({
+          error: {
+            code: "invalid_deviation_transition",
+            message: `A ${result.deviation.state} deviation cannot be ${action}d.`,
+          },
+        });
+      }
+      const deviation = {
+        ...result.deviation,
+        initial_evidence: JSON.parse(result.deviation.initial_evidence),
+        evidence: JSON.parse(result.deviation.evidence),
+      };
+      const eventType = action === "acknowledge"
+        ? "deviation_acknowledged"
+        : "deviation_resolved";
+      const event = {
+        id: result.event_id,
+        from_state: result.from_state,
+        to_state: deviation.state,
+        operator_notes: notes.value,
+        created_at: deviation.updated_at,
+      };
+      broadcast({
+        type: eventType,
+        machineId: deviation.machine_id,
+        jobId: deviation.job_id,
+        deviation: { ...deviation, lifecycle_event: event },
+      });
+      return response.json({ deviation, lifecycle_event: event });
+    } catch (error) {
+      console.error(`Could not ${action} job deviation:`, error);
+      return response.status(500).json({
+        error: {
+          code: "deviation_transition_failed",
+          message: "The deviation state could not be changed.",
+        },
+      });
+    }
+  };
+}
+
+app.post("/api/deviations/:id/acknowledge", handleDeviationTransition("acknowledge"));
+app.post("/api/deviations/:id/resolve", handleDeviationTransition("resolve"));
+
+app.post("/api/deviations/:id/investigate", async (request, response) => {
+  const deviationId = request.params.id;
+  if (!isValidMachineId(deviationId)) {
+    return response.status(400).json({
+      error: { code: "invalid_deviation_id", message: "Deviation ID must be a UUID." },
+    });
+  }
+  try {
+  const database = getDatabase();
+  const deviation = database
+    .prepare("SELECT * FROM job_deviations WHERE id = ?")
+    .get(deviationId);
+  if (!deviation) {
+    return response.status(404).json({
+      error: { code: "deviation_not_found", message: "No deviation exists with that ID." },
+    });
+  }
+  const job = getJob(database, deviation.job_id);
+  const machine = findMachine(database, deviation.machine_id);
+  if (!job || !machine) {
+    return response.status(409).json({
+      error: { code: "investigation_context_unavailable", message: "The job or machine context is no longer available." },
+    });
+  }
+  const validHistory = getValidAnalysisHistory(database, deviation.machine_id, {
+    limit: 30,
+    offset: 0,
+  });
+  const trend = publicTrendResult(
+    analyzeTrend(getValidTrendRecords(database, deviation.machine_id), getTrendConfig()),
+  );
+  const facts = {
+    deviation: {
+      id: deviation.id,
+      category: deviation.category,
+      severity: deviation.severity,
+      explanation: deviation.explanation,
+      first_detected_at: deviation.first_detected_at,
+      latest_detected_at: deviation.latest_detected_at,
+      supporting_evidence: JSON.parse(deviation.evidence),
+    },
+    machine: { id: machine.id, label: machine.label, type: machine.machine_type },
+    valid_machine_history: validHistory.map((record) => ({
+      id: record.id,
+      timestamp: record.timestamp,
+      analysis_status: record.analysis_status,
+      machine_status: record.machine_status,
+      failure_type: record.failure_type,
+      abnormality_score: record.abnormality_score,
+      confidence: record.confidence,
+    })),
+    historical_failure_categories: [...new Set(
+      validHistory
+        .map((record) => record.failure_type)
+        .filter((type) => type && !["none", "unknown"].includes(type)),
+    )],
+    phase2_trend: trend,
+    telemetry: { status: "NOT_AVAILABLE", values: null },
+    evidence_limitations: [
+      "Camera classifications are visual AI evidence, not physical telemetry.",
+      "G-code and job parameters are intended instructions, not proof of execution.",
+      "No temperature, speed, power, tool-load, or controller-completion telemetry is connected.",
+    ],
+  };
+  const evidenceIds = new Set([
+    ...facts.deviation.supporting_evidence.observations.map((observation) => observation.id),
+    ...facts.valid_machine_history.map((record) => record.id),
+  ]);
+  const evidenceFingerprint = createHash("sha256")
+    .update(JSON.stringify({ facts, job: { id: job.id, updated_at: job.updated_at } }))
+    .digest("hex");
+  const reservation = reserveRootCauseReport(database, {
+    deviation,
+    provider,
+    model,
+    evidenceFingerprint,
+    observedFacts: facts,
+  });
+  if (!reservation.created) {
+    const statusCode = reservation.report.status === "PENDING" ? 202 : 200;
+    return response.status(statusCode).json({ report: reservation.report, reused: true });
+  }
+  const reportId = reservation.report.id;
+  const hasProviderKey = provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groq);
+  if (!hasProviderKey) {
+    failRootCauseReport(database, reportId, "missing_provider_key");
+    return response.status(503).json({
+      error: { code: "root_cause_provider_unavailable", message: "No configured AI provider is available for investigation." },
+    });
+  }
+  try {
+    const rawReport = await requestStructuredCompletion(
+      buildRootCausePrompt({ deviation, job, facts }),
+    );
+    const validatedReport = validateRootCauseResponse(rawReport, evidenceIds);
+    if (!validatedReport) {
+      failRootCauseReport(database, reportId, "invalid_structured_response");
+      return response.status(502).json({
+        error: { code: "invalid_root_cause_response", message: "The AI provider returned an invalid root-cause report." },
+      });
+    }
+    const stored = completeRootCauseReport(database, reportId, validatedReport);
+    if (!stored) throw new Error("The pending root-cause report could not be finalized.");
+    const report = {
+      ...reservation.report,
+      status: "COMPLETED",
+      report: validatedReport,
+      updated_at: new Date().toISOString(),
+    };
+    broadcast({
+      type: "root_cause_report_created",
+      machineId: deviation.machine_id,
+      jobId: deviation.job_id,
+      report,
+    });
+    return response.status(201).json({ report, reused: false });
+  } catch (error) {
+    console.error("Root-cause investigation failed; camera monitoring is unaffected:", error);
+    failRootCauseReport(
+      database,
+      reportId,
+      error?.invalidResponse ? "invalid_provider_response" : "provider_error",
+    );
+    return response.status(502).json({
+      error: { code: "root_cause_investigation_failed", message: "The AI investigation failed; monitoring and stored evidence remain available." },
+    });
+  }
+  } catch (error) {
+    console.error("Could not prepare root-cause investigation:", error);
+    return response.status(500).json({
+      error: { code: "root_cause_context_unavailable", message: "The investigation evidence could not be prepared." },
+    });
+  }
+});
+
+app.get("/api/jobs/:id/insights", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const job = getJob(database, jobId);
+    if (!job) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    return response.json({ insights: getJobInsights(database, job) });
+  } catch (error) {
+    console.error("Could not load job insights:", error);
+    return response.status(500).json({
+      error: { code: "job_insights_unavailable", message: "Job insights could not be loaded." },
+    });
+  }
+});
+
+app.get("/api/jobs/:id/comparison", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    if (!getJob(database, jobId)) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    return response.json({ comparisons: listJobComparisons(database, jobId) });
+  } catch (error) {
+    console.error("Could not load job comparisons:", error);
+    return response.status(500).json({
+      error: { code: "job_comparison_unavailable", message: "Job comparisons could not be loaded." },
+    });
+  }
+});
+
+app.post("/api/jobs/:id/comparison", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const job = getJob(database, jobId);
+    if (!job) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    const records = getJobAnalysisHistoryForInsights(database, job.id);
+    const trend = publicTrendResult(
+      analyzeTrend(getValidTrendRecords(database, job.machine_id), getTrendConfig()),
+    );
+    const comparison = compareJobEvidence(job, records, trend);
+    const result = persistJobComparison(database, job, comparison);
+    if (result.created) {
+      broadcast({
+        type: "job_comparison_updated",
+        machineId: job.machine_id,
+        jobId: job.id,
+        comparison: result.comparison,
+      });
+    }
+    return response.status(result.created ? 201 : 200).json({
+      comparison: result.comparison,
+      reused: !result.created,
+    });
+  } catch (error) {
+    console.error("Could not compare job intent with available evidence:", error);
+    return response.status(500).json({
+      error: { code: "job_comparison_failed", message: "The job comparison could not be calculated." },
+    });
+  }
+});
+
+app.get("/api/jobs/:id/completion-verifications", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  try {
+    const job = getJob(getDatabase(), jobId);
+    if (!job) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    return response.json({
+      verifications: getJobInsights(getDatabase(), job).completion_verifications,
+    });
+  } catch (error) {
+    console.error("Could not load completion verification history:", error);
+    return response.status(500).json({
+      error: { code: "completion_history_unavailable", message: "Completion verification history could not be loaded." },
+    });
+  }
+});
+
+app.post("/api/jobs/:id/completion-verifications", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  const action = request.body?.action;
+  if (!["evaluate", "confirm"].includes(action)) {
+    return response.status(400).json({
+      error: { code: "invalid_completion_action", message: "Action must be evaluate or confirm." },
+    });
+  }
+  const notes = validOperatorNotes(request.body);
+  if (notes.error) {
+    return response.status(400).json({
+      error: { code: "invalid_operator_notes", message: notes.error },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const job = getJob(database, jobId);
+    if (!job) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    if (action === "confirm" && job.status !== "COMPLETED") {
+      return response.status(409).json({
+        error: {
+          code: "job_lifecycle_not_completed",
+          message: "Mark the job COMPLETED through its lifecycle action before recording operator verification.",
+        },
+      });
+    }
+    const latestAnalysis = database.prepare(`
+      SELECT id, timestamp, machine_status, analysis_status, failure_type,
+             abnormality_score, confidence, risk_classification, is_uncertain
+      FROM analysis_records
+      WHERE job_id = ? AND is_valid = 1 AND abnormality_score IS NOT NULL
+      ORDER BY timestamp DESC, id DESC
+      LIMIT 1
+    `).get(jobId) || null;
+    const verification = evaluateCompletionVerification(job, latestAnalysis, {
+      operatorConfirmed: action === "confirm",
+      operatorNotes: action === "confirm" ? notes.value : null,
+    });
+    const stored = persistCompletionVerification(database, job, verification);
+    if (!stored.reused) {
+      broadcast({
+        type: "job_completion_verification_updated",
+        machineId: job.machine_id,
+        jobId: job.id,
+        verification: stored,
+      });
+    }
+    return response.status(stored.reused ? 200 : 201).json({ verification: stored });
+  } catch (error) {
+    console.error("Could not record job completion verification:", error);
+    return response.status(500).json({
+      error: { code: "completion_verification_failed", message: "Completion verification could not be recorded." },
+    });
+  }
+});
+
+app.get("/api/jobs/:id/history", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  const requestedLimit = request.query.limit === undefined ? 50 : Number(request.query.limit);
+  const offset = request.query.offset === undefined ? 0 : Number(request.query.offset);
+  if (
+    !Number.isInteger(requestedLimit) ||
+    requestedLimit < 1 ||
+    !Number.isInteger(offset) ||
+    offset < 0
+  ) {
+    return response.status(400).json({
+      error: {
+        code: "invalid_pagination",
+        message: "Limit must be positive and offset non-negative.",
+      },
+    });
+  }
+  try {
+    const database = getDatabase();
+    if (!getJob(database, jobId)) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    return response.json({
+      job_id: jobId,
+      records: getJobAnalysisHistory(database, jobId, {
+        limit: Math.min(requestedLimit, 200),
+        offset,
+      }),
+      limit: Math.min(requestedLimit, 200),
+      offset,
+    });
+  } catch (error) {
+    console.error("Could not load job analysis history:", error);
+    return response.status(500).json({
+      error: { code: "job_history_unavailable", message: "Job analysis history could not be loaded." },
+    });
+  }
+});
+
+app.patch("/api/jobs/:id", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const existing = getJob(database, jobId);
+    if (!existing) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    const validated = jobInputForUpdate(request.body, existing);
+    if (validated.error) {
+      return response.status(400).json({
+        error: { code: "invalid_job", message: validated.error },
+      });
+    }
+    const result = updateJob(database, jobId, validated.value);
+    if (result.reason === "job_not_editable") {
+      return response.status(409).json({
+        error: { code: "job_not_editable", message: "Only DRAFT and READY jobs can be edited." },
+      });
+    }
+    return response.json({ job: result.job });
+  } catch (error) {
+    console.error("Could not update job:", error);
+    return response.status(500).json({
+      error: { code: "job_update_failed", message: "The job could not be updated." },
+    });
+  }
+});
+
+app.post("/api/jobs/:id/gcode", jobFileBody, (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  if (!Buffer.isBuffer(request.body) || request.body.length === 0) {
+    return response.status(400).json({
+      error: { code: "empty_gcode_file", message: "The G-code file is empty." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const job = getJob(database, jobId);
+    if (!job) {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    let filename;
+    try {
+      filename = validateGcodeFilename(request.query.filename, job.machine_type);
+    } catch (error) {
+      return response.status(400).json({
+        error: { code: "invalid_gcode_filename", message: error.message },
+      });
+    }
+    let content;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(request.body);
+    } catch {
+      return response.status(400).json({
+        error: { code: "invalid_gcode_encoding", message: "G-code must be valid UTF-8 text." },
+      });
+    }
+    let summary;
+    try {
+      summary = parseGcode(content, job.machine_type);
+    } catch (error) {
+      return response.status(400).json({
+        error: { code: "invalid_gcode_file", message: error.message },
+      });
+    }
+    const result = saveJobFile(database, jobId, {
+      filename,
+      dialect: job.machine_type,
+      sizeBytes: request.body.length,
+      sha256: createHash("sha256").update(request.body).digest("hex"),
+      summary,
+      content,
+    });
+    if (result.reason === "job_not_editable") {
+      return response.status(409).json({
+        error: { code: "job_not_editable", message: "G-code can only be uploaded to DRAFT or READY jobs." },
+      });
+    }
+    broadcast({
+      type: "job_file_uploaded",
+      machineId: result.job.machine_id,
+      job: result.job,
+    });
+    return response.status(201).json({ job: result.job });
+  } catch (error) {
+    console.error("Could not store G-code file:", error);
+    return response.status(500).json({
+      error: { code: "gcode_upload_failed", message: "The G-code file could not be stored." },
+    });
+  }
+});
+
+app.post("/api/jobs/:id/transition", (request, response) => {
+  const jobId = request.params.id;
+  if (!isValidMachineId(jobId)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_id", message: "Job ID must be a UUID." },
+    });
+  }
+  const nextStatus = request.body?.status;
+  const supportedStatuses = new Set([
+    "DRAFT", "READY", "RUNNING", "PAUSED", "COMPLETED", "FAILED", "CANCELLED",
+  ]);
+  if (typeof nextStatus !== "string" || !supportedStatuses.has(nextStatus)) {
+    return response.status(400).json({
+      error: { code: "invalid_job_status", message: "Job status is not recognized." },
+    });
+  }
+  try {
+    const result = transitionJob(getDatabase(), jobId, nextStatus);
+    if (result.reason === "job_not_found") {
+      return response.status(404).json({
+        error: { code: "job_not_found", message: "No job exists with that ID." },
+      });
+    }
+    if (result.reason === "invalid_transition") {
+      return response.status(409).json({
+        error: { code: "invalid_job_transition", message: "That job lifecycle transition is not allowed." },
+      });
+    }
+    if (result.reason === "machine_has_active_job") {
+      return response.status(409).json({
+        error: { code: "machine_has_active_job", message: "This machine already has a running or paused job." },
+      });
+    }
+    if (result.changed) {
+      const eventType = nextStatus === "RUNNING"
+        ? "job_started"
+        : nextStatus === "COMPLETED"
+          ? "job_completed"
+          : "job_status_update";
+      broadcast({ type: eventType, machineId: result.job.machine_id, job: result.job });
+    }
+    return response.json({ job: result.job });
+  } catch (error) {
+    console.error("Could not transition job:", error);
+    return response.status(500).json({
+      error: { code: "job_transition_failed", message: "The job status could not be changed." },
+    });
+  }
+});
+
+app.get("/api/machines/:id/history", (request, response) => {
+  const machineId = request.params.id;
+  if (!isValidMachineId(machineId)) {
+    return response.status(400).json({
+      error: { code: "invalid_machine_id", message: "Machine ID must be a UUID." },
+    });
+  }
+
+  const requestedLimit = request.query.limit === undefined ? 50 : Number(request.query.limit);
+  const offset = request.query.offset === undefined ? 0 : Number(request.query.offset);
+  if (
+    !Number.isInteger(requestedLimit) ||
+    requestedLimit < 1 ||
+    !Number.isInteger(offset) ||
+    offset < 0
+  ) {
+    return response.status(400).json({
+      error: {
+        code: "invalid_pagination",
+        message: "Limit must be a positive integer and offset must be a non-negative integer.",
+      },
+    });
+  }
+
+  try {
+    const database = getDatabase();
+    if (!findMachine(database, machineId)) {
+      return response.status(404).json({
+        error: { code: "machine_not_found", message: "No machine exists with that ID." },
+      });
+    }
+    const records = getValidAnalysisHistory(database, machineId, {
+      limit: Math.min(requestedLimit, 200),
+      offset,
+    });
+    return response.json({
+      machine_id: machineId,
+      records,
+      limit: Math.min(requestedLimit, 200),
+      offset,
+    });
+  } catch (error) {
+    console.error("Could not load machine analysis history:", error);
+    return response.status(500).json({
+      error: { code: "history_unavailable", message: "Machine history could not be loaded." },
+    });
+  }
+});
+
+app.get("/api/machines/:id/trend", (request, response) => {
+  const machineId = request.params.id;
+  if (!isValidMachineId(machineId)) {
+    return response.status(400).json({
+      error: { code: "invalid_machine_id", message: "Machine ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    const machine = findMachine(database, machineId);
+    if (!machine) {
+      return response.status(404).json({
+        error: { code: "machine_not_found", message: "No machine exists with that ID." },
+      });
+    }
+    const { config, trend } = analyzeMachineHistory(database, machineId);
+    return response.json({
+      machine_id: machineId,
+      machine_label: machine.label,
+      minimum_observations: config.minimumObservations,
+      risk_thresholds: {
+        warning: config.riskHighThreshold,
+        critical: config.riskCriticalThreshold,
+      },
+      ...publicTrendResult(trend),
+    });
+  } catch (error) {
+    console.error("Could not calculate machine trend:", error);
+    return response.status(500).json({
+      error: { code: "trend_unavailable", message: "Machine trend could not be calculated." },
+    });
+  }
+});
+
+app.get("/api/machines/:id/early-warnings", (request, response) => {
+  const machineId = request.params.id;
+  if (!isValidMachineId(machineId)) {
+    return response.status(400).json({
+      error: { code: "invalid_machine_id", message: "Machine ID must be a UUID." },
+    });
+  }
+  try {
+    const database = getDatabase();
+    if (!findMachine(database, machineId)) {
+      return response.status(404).json({
+        error: { code: "machine_not_found", message: "No machine exists with that ID." },
+      });
+    }
+    return response.json({
+      machine_id: machineId,
+      warnings: listMachineWarnings(database, machineId).map(warningResponse),
+    });
+  } catch (error) {
+    console.error("Could not load machine early warnings:", error);
+    return response.status(500).json({
+      error: { code: "warnings_unavailable", message: "Machine warnings could not be loaded." },
+    });
+  }
+});
+
+for (const transitionName of ["acknowledge", "resolve"]) {
+  app.post(`/api/warnings/:warningId/${transitionName}`, (request, response) => {
+    const warningId = request.params.warningId;
+    if (!isValidMachineId(warningId)) {
+      return response.status(400).json({
+        error: { code: "invalid_warning_id", message: "Warning ID must be a UUID." },
+      });
+    }
+    const operatorNotes =
+      typeof request.body?.operator_notes === "string"
+        ? request.body.operator_notes.trim().slice(0, 1000)
+        : null;
+    if (request.body?.operator_notes !== undefined && typeof request.body.operator_notes !== "string") {
+      return response.status(400).json({
+        error: { code: "invalid_operator_notes", message: "Operator notes must be a string." },
+      });
+    }
+    try {
+      const transition = transitionWarning(
+        getDatabase(),
+        warningId,
+        transitionName,
+        operatorNotes || null,
+      );
+      if (!transition.warning) {
+        return response.status(404).json({
+          error: { code: "warning_not_found", message: "No warning exists with that ID." },
+        });
+      }
+      if (transition.conflict) {
+        return response.status(409).json({
+          error: { code: "warning_already_resolved", message: "A resolved warning cannot be acknowledged." },
+        });
+      }
+      if (transition.changed) {
+        const type = transitionName === "acknowledge" ? "warning_acknowledged" : "warning_resolved";
+        broadcast({
+          type,
+          machineId: transition.warning.machine_id,
+          warning: warningResponse(transition.warning),
+        });
+      }
+      return response.json({ warning: warningResponse(transition.warning) });
+    } catch (error) {
+      console.error(`Could not ${transitionName} warning:`, error);
+      return response.status(500).json({
+        error: { code: "warning_transition_failed", message: "The warning state could not be updated." },
+      });
+    }
+  });
+}
+
 app.get("/api/config", (_request, response) => {
 const activeKey = provider === "openrouter" ? openrouterApiKey : groqApiKey;
 response.json({
 provider,
 hasApiKey: Boolean(provider === "openrouter" ? openrouterApiKey : groq),
 model,
+providerSource,
+modelSource,
+projectEnvLoaded: Boolean(dotenvLoadResult.parsed),
 maskedApiKey: maskKey(activeKey),
 });
 });
@@ -137,6 +1334,8 @@ error: "No OpenRouter API key configured. Enter your OpenRouter key (sk-or-v1-..
 }
 provider = "openrouter";
 model = requestedModel;
+providerSource = "runtime_settings";
+modelSource = "runtime_settings";
 process.env.AI_PROVIDER = "openrouter";
 process.env.OPENROUTER_MODEL = model;
 upsertEnvFile({ AI_PROVIDER: "openrouter", OPENROUTER_MODEL: model });
@@ -148,11 +1347,14 @@ error: "No Groq API key configured for scanning. Enter your Groq key (gsk_...)."
 }
 provider = "groq";
 model = requestedModel;
+providerSource = "runtime_settings";
+modelSource = "runtime_settings";
 process.env.AI_PROVIDER = "groq";
 process.env.GROQ_MODEL = model;
 upsertEnvFile({ AI_PROVIDER: "groq", GROQ_MODEL: model });
 } else {
 model = requestedModel;
+modelSource = "runtime_settings";
 if (provider === "openrouter") {
 process.env.OPENROUTER_MODEL = model;
 upsertEnvFile({ OPENROUTER_MODEL: model });
@@ -163,7 +1365,14 @@ upsertEnvFile({ GROQ_MODEL: model });
 }
 console.log(`Scanning model switched to: ${model} (${provider}).`);
 const activeKey = provider === "openrouter" ? openrouterApiKey : groqApiKey;
-return response.json({ ok: true, provider, model, maskedApiKey: maskKey(activeKey) });
+return response.json({
+ok: true,
+provider,
+model,
+providerSource,
+modelSource,
+maskedApiKey: maskKey(activeKey),
+});
 } catch (error) {
 console.error("Failed to update model:", error);
 return response.status(500).json({ error: "The model could not be saved on the server." });
@@ -181,14 +1390,17 @@ error: "Please enter a valid OpenRouter API key (starts with 'sk-or-') or Groq A
 try {
 if (isOpenRouterKey) {
 provider = "openrouter";
+providerSource = "runtime_settings";
 openrouterApiKey = apiKey;
 process.env.AI_PROVIDER = "openrouter";
 process.env.OPENROUTER_API_KEY = apiKey;
 if (requestedModel) {
 model = requestedModel;
+modelSource = "runtime_settings";
 process.env.OPENROUTER_MODEL = requestedModel;
 } else if (!model || !model.includes("/")) {
 model = DEFAULT_OPENROUTER_MODEL;
+modelSource = "default";
 process.env.OPENROUTER_MODEL = model;
 }
 upsertEnvFile({
@@ -199,15 +1411,18 @@ OPENROUTER_MODEL: model,
 console.log(`OpenRouter key configured (${maskKey(apiKey)}). Model: ${model}`);
 } else {
 provider = "groq";
+providerSource = "runtime_settings";
 groqApiKey = apiKey;
 groq = new Groq({ apiKey });
 process.env.AI_PROVIDER = "groq";
 process.env.GROQ_API_KEY = apiKey;
 if (requestedModel) {
 model = requestedModel;
+modelSource = "runtime_settings";
 process.env.GROQ_MODEL = requestedModel;
 } else if (!model || model.startsWith("anthropic/") || model.startsWith("meta-llama/") || model.startsWith("nvidia/")) {
 model = DEFAULT_GROQ_MODEL;
+modelSource = "default";
 process.env.GROQ_MODEL = model;
 }
 upsertEnvFile({
@@ -217,7 +1432,14 @@ GROQ_MODEL: model,
 });
 console.log(`Groq API key configured (${maskKey(apiKey)}). Model: ${model}`);
 }
-response.json({ ok: true, provider, model, maskedApiKey: maskKey(apiKey) });
+response.json({
+ok: true,
+provider,
+model,
+providerSource,
+modelSource,
+maskedApiKey: maskKey(apiKey),
+});
 } catch (error) {
 console.error("Failed to save API key:", error);
 response.status(500).json({ error: "The key could not be saved on the server." });
@@ -618,7 +1840,28 @@ const end = body.lastIndexOf("}");
 if (start === -1 || end === -1 || end < start) return body;
 return body.slice(start, end + 1);
 }
+function isValidAnalysisResponse(value) {
+return Boolean(
+  value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    ["normal", "warning", "failure", "unclear"].includes(value.status) &&
+    Number.isFinite(value.severity) &&
+    value.severity >= 0 &&
+    value.severity <= 10 &&
+    Number.isFinite(value.confidence) &&
+    value.confidence >= 0 &&
+    value.confidence <= 1 &&
+    typeof value.failure_type === "string" &&
+    value.failure_type.trim(),
+);
+}
 async function requestAnalysis(content) {
+if (provider !== "groq" && provider !== "openrouter") {
+  const error = new Error(`Unsupported AI_PROVIDER value "${provider}". Use "groq" or "openrouter".`);
+  error.code = "provider_configuration_error";
+  throw error;
+}
 const maxAttempts = 2;
 let lastRawText = "";
 for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -688,7 +1931,13 @@ lastRawText = "";
 continue;
 }
 try {
-return { rawResult: JSON.parse(extractJson(rawText)), attempts: attempt };
+const rawResult = JSON.parse(extractJson(rawText));
+if (!isValidAnalysisResponse(rawResult)) {
+  lastRawText = rawText;
+  console.error(`Attempt ${attempt}/${maxAttempts} returned malformed analysis fields.`);
+  continue;
+}
+return { rawResult, attempts: attempt };
 } catch {
 lastRawText = rawText;
 console.error(
@@ -702,6 +1951,70 @@ const error = new Error(`${providerLabel} returned text that was not valid JSON 
 error.invalidJson = true;
 error.rawText = lastRawText;
 throw error;
+}
+async function requestStructuredCompletion(content) {
+let rawText = "";
+if (provider === "openrouter") {
+if (!openrouterApiKey) throw new Error("No OpenRouter API key is configured.");
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+try {
+const fetchRes = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+method: "POST",
+headers: {
+"Authorization": `Bearer ${openrouterApiKey}`,
+"Content-Type": "application/json",
+"HTTP-Referer": "http://localhost:3001",
+"X-Title": "Watch Guard",
+},
+body: JSON.stringify({
+model,
+messages: [{ role: "user", content }],
+response_format: { type: "json_object" },
+temperature: 0,
+max_tokens: 1800,
+}),
+signal: controller.signal,
+});
+if (!fetchRes.ok) {
+const error = new Error(`OpenRouter returned HTTP ${fetchRes.status}.`);
+error.status = fetchRes.status;
+throw error;
+}
+const result = await fetchRes.json();
+rawText = result?.choices?.[0]?.message?.content || "";
+} finally {
+clearTimeout(timer);
+}
+} else {
+if (!groq) throw new Error("No Groq client is configured.");
+const isReasoningModel = /qwen|deepseek/i.test(model);
+const completion = await groq.chat.completions.create(
+{
+model,
+messages: [{ role: "user", content }],
+response_format: { type: "json_object" },
+...(isReasoningModel ? { reasoning_effort: "none", reasoning_format: "hidden" } : {}),
+temperature: 0,
+max_completion_tokens: 1800,
+stream: false,
+},
+{ timeout: requestTimeoutMs, maxRetries: 1 },
+);
+rawText = completion.choices[0]?.message?.content || "";
+}
+if (!rawText) {
+const error = new Error("The AI provider returned an empty root-cause response.");
+error.invalidResponse = true;
+throw error;
+}
+try {
+return JSON.parse(extractJson(rawText));
+} catch {
+const error = new Error("The AI provider returned malformed root-cause JSON.");
+error.invalidResponse = true;
+throw error;
+}
 }
 const CONFIRMATION_STREAK = Number(process.env.CONFIRMATION_STREAK || 3);
 const cameraConfirmations = new Map();
@@ -756,6 +2069,8 @@ lastAlertAt: Date.now(),
 }
 
 let wss = null;
+let sensorHealthTimer = null;
+let processHandlersRegistered = false;
 function broadcast(message) {
 if (!wss) return;
 const payload = JSON.stringify(message);
@@ -763,6 +2078,142 @@ for (const client of wss.clients) {
 if (client.readyState === client.OPEN) client.send(payload);
 }
 }
+const simulationService = createSimulationService({ databaseProvider: getDatabase, broadcast });
+app.use("/api", createSensorRouter({ broadcast }));
+app.use("/api", createSimulationRouter({ service: simulationService }));
+app.use("/api/quality", createProductQualityRouter({
+  databaseProvider: getDatabase,
+  getProviderState: () => ({
+    providerName: provider === "openrouter" ? "OpenRouter" : "Groq",
+    model,
+    hasApiKey: provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groq),
+  }),
+  completeVision: async (messages, { maxTokens, timeoutMs }) => {
+    const timeout = Math.min(60_000, Math.max(1_000, Number(timeoutMs) || requestTimeoutMs));
+    if (provider === "openrouter") {
+      if (!openrouterApiKey) {
+        const error = new Error("OpenRouter API key is not configured.");
+        error.code = "provider_configuration_error";
+        throw error;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
+      try {
+        const result = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${openrouterApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:3001",
+            "X-Title": "Vision OPS Product Quality Inspection",
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            response_format: { type: "json_object" },
+            temperature: 0,
+            max_tokens: maxTokens,
+          }),
+          signal: controller.signal,
+        });
+        if (!result.ok) {
+          const error = new Error(`OpenRouter returned HTTP ${result.status}.`);
+          error.status = result.status;
+          throw error;
+        }
+        const payload = await result.json();
+        return payload?.choices?.[0]?.message?.content;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (!groq) {
+      const error = new Error("Groq API key is not configured.");
+      error.code = "provider_configuration_error";
+      throw error;
+    }
+    const isReasoningModel = /qwen|deepseek/i.test(model);
+    const completion = await groq.chat.completions.create(
+      {
+        model,
+        messages,
+        response_format: { type: "json_object" },
+        temperature: 0,
+        max_completion_tokens: maxTokens,
+        stream: false,
+        ...(isReasoningModel ? { reasoning_effort: "none", reasoning_format: "hidden" } : {}),
+      },
+      { timeout, maxRetries: 0 },
+    );
+    return completion.choices[0]?.message?.content;
+  },
+}));
+app.use("/api/copilot", createCopilotRouter({
+  databaseProvider: getDatabase,
+  getProviderState: () => ({
+    providerName: provider === "openrouter" ? "OpenRouter" : "Groq",
+    model,
+    hasApiKey: provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groq),
+    secrets: [groqApiKey, openrouterApiKey],
+  }),
+  complete: async (messages, { maxTokens, timeoutMs }) => {
+    const timeout = Math.min(60_000, Math.max(1_000, Number(timeoutMs) || requestTimeoutMs));
+    if (provider === "openrouter") {
+      if (!openrouterApiKey) {
+        const error = new Error("OpenRouter API key is not configured.");
+        error.code = "provider_configuration_error";
+        throw error;
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeout);
+      try {
+        const result = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${openrouterApiKey}`,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:3001",
+            "X-Title": "Vision OPS Manufacturing Copilot",
+          },
+          body: JSON.stringify({
+            model,
+            messages,
+            temperature: 0.2,
+            max_tokens: maxTokens,
+          }),
+          signal: controller.signal,
+        });
+        if (!result.ok) {
+          const error = new Error(`OpenRouter returned HTTP ${result.status}.`);
+          error.status = result.status;
+          throw error;
+        }
+        const payload = await result.json();
+        return payload?.choices?.[0]?.message?.content;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    if (!groq) {
+      const error = new Error("Groq API key is not configured.");
+      error.code = "provider_configuration_error";
+      throw error;
+    }
+    const isReasoningModel = /qwen|deepseek/i.test(model);
+    const completion = await groq.chat.completions.create(
+      {
+        model,
+        messages,
+        temperature: 0.2,
+        max_completion_tokens: maxTokens,
+        stream: false,
+        ...(isReasoningModel ? { reasoning_effort: "none", reasoning_format: "hidden" } : {}),
+      },
+      { timeout, maxRetries: 0 },
+    );
+    return completion.choices[0]?.message?.content;
+  },
+}));
 // Notification wiring lives in notifications.mjs; these endpoints let the
 // webhook be configured and tested without touching the UI.
 app.get("/api/notifications", (_request, response) => {
@@ -861,10 +2312,60 @@ const driver = printerDrivers[driverName] || printerDrivers.none;
 return driver.pause();
 }
 app.post("/api/analyze-machine", async (request, response) => {
+const body = request.body && typeof request.body === "object" ? request.body : {};
+const suppliedCameraId =
+ typeof body.cameraId === "string" && body.cameraId.trim()
+   ? body.cameraId.trim().slice(0, 200)
+   : null;
+const cameraId = suppliedCameraId || "default";
+const cameraLabel = clean(body.cameraLabel, 100) || cameraId;
+const machineType = clean(body.machineType || "3d_printer", 60) || "3d_printer";
+let machine = null;
+let activeJob = null;
+try {
+ if (suppliedCameraId) {
+   try {
+     machine = registerMachine(getDatabase(), {
+       cameraId: suppliedCameraId,
+       label: cameraLabel,
+       machineType,
+     });
+   } catch (error) {
+     console.error("Could not register the camera's machine identity:", error);
+   }
+ } else {
+   console.warn("Analysis request has no camera deviceId; it will not be linked to an existing machine.");
+ }
+ if (machine) {
+   try {
+     activeJob = findActiveJobForMachine(getDatabase(), machine.id);
+   } catch (error) {
+     console.error("Could not load active job context; continuing without job context:", error);
+   }
+ }
+ const recordInvalidAttempt = ({ reason, errorCategory }) => {
+   try {
+     persistInvalidAnalysis(getDatabase(), {
+       machineId: machine?.id || null,
+       machineType,
+       reason,
+       provider,
+       errorCategory,
+       cameraId: suppliedCameraId,
+       jobId: activeJob?.id || null,
+     });
+   } catch (error) {
+     console.error("Could not persist invalid analysis audit record:", error);
+   }
+ };
 try {
 const hasKey = provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groq);
 if (!hasKey) {
 const providerLabel = provider === "openrouter" ? "OpenRouter" : "Groq";
+recordInvalidAttempt({
+ reason: `No ${providerLabel} API key is configured.`,
+ errorCategory: "missing_api_key",
+});
 return response.status(401).json({
 error: `No ${providerLabel} API key is configured yet. Add one in .env or the setup screen.`,
 code: "missing_api_key",
@@ -875,14 +2376,13 @@ currentImageDataUrl,
 emptyPlateReferenceDataUrl,
 expectedPartReferenceDataUrl,
 previousImageDataUrl,
-machineType = "3d_printer",
 jobContext = {},
-cameraId: rawCameraId,
-cameraLabel: rawCameraLabel,
-} = request.body;
-const cameraId = clean(rawCameraId, 200) || "default";
-const cameraLabel = clean(rawCameraLabel, 100) || cameraId;
+} = body;
 if (!isImage(currentImageDataUrl)) {
+recordInvalidAttempt({
+ reason: "A valid current camera image was not received.",
+ errorCategory: "invalid_camera_input",
+});
 return response.status(400).json({
 error: "A valid current camera image was not received.",
 });
@@ -909,6 +2409,10 @@ const totalCharacters = images.reduce(
 // (e.g. a full-resolution upload) slipping through — normal 384px frames
 // land far below this.
 if (totalCharacters > 350_000) {
+recordInvalidAttempt({
+  reason: "The camera frame request exceeded the supported image size.",
+  errorCategory: "image_too_large",
+});
 return response.status(413).json({
 error:
 "The combined images are too large for the current Groq rate limit. Reduce camera resolution/quality or clear an unnecessary reference image.",
@@ -918,12 +2422,30 @@ const safeJobContext = {
 cameraName: clean(jobContext.cameraName, 100),
 material: clean(jobContext.material, 80),
 operator: clean(jobContext.operator, 80),
+registeredJob: activeJob
+  ? {
+      id: activeJob.id,
+      name: activeJob.name,
+      status: activeJob.status,
+      job_type: activeJob.job_type,
+      machine_type: activeJob.machine_type,
+      material_type: activeJob.material_type,
+      expected_duration_seconds: activeJob.expected_duration_seconds,
+      expected_parameters: activeJob.expected_parameters,
+      gcode_summary: activeJob.file?.summary || null,
+    }
+  : null,
 };
 // Rebuilt per attempt: if the reference image has to be dropped to fit the
 // token budget, the prompt must stop claiming one was sent.
 const buildPrompt = (referenceType) => `
 You are Watch Guard, a conservative fabrication-machine visual inspector.
 Use only visible evidence. Never invent motion, sound, heat, smoke, or events.
+If registeredJob is present in context, treat its settings and parsed program only as operator intent;
+they are not measured telemetry and do not prove execution. Do not claim a temperature, spindle,
+feed-rate, or progress mismatch unless the corresponding sensor/evidence is actually available.
+If expected progress cannot be compared with visible evidence, describe it as unavailable rather
+than a failure. Missing telemetry is unknown, not a deviation.
 When the evidence sits between two classifications, prefer the one that flags a possible
 problem over the one that assumes the machine is fine — a small, easy-to-miss issue (one
 lifted corner, one stray strand, a faint smoke haze) still counts as visible evidence and
@@ -1035,15 +2557,140 @@ const latencyMs = Date.now() - startedAt;
 const providerLabel = provider === "openrouter" ? "OpenRouter" : "Groq";
 console.log(`${providerLabel} responded in ${latencyMs}ms (attempts=${attempts}).`);
 const normalized = normalizeResult(rawResult, { machineType });
+if (!machine) {
+  try {
+    machine = registerMachine(getDatabase(), {
+      cameraId: null,
+      label: cameraLabel,
+      machineType,
+    });
+  } catch (error) {
+    console.error("Could not create an unlinked machine identity for this analysis:", error);
+  }
+}
+let previousTrend = null;
+let analysisPersisted = false;
+try {
+  if (!machine) throw new Error("Machine identity is unavailable.");
+  const database = getDatabase();
+  const config = getTrendConfig();
+  previousTrend = analyzeTrend(getValidTrendRecords(database, machine.id), config);
+  persistValidAnalysis(database, {
+    machineId: machine.id,
+    machineType,
+    result: normalized,
+    jobId: activeJob?.id || null,
+  });
+  analysisPersisted = true;
+} catch (error) {
+  console.error("Could not persist valid analysis; continuing with notifications and response:", error);
+}
+if (analysisPersisted && machine) {
+  try {
+    const database = getDatabase();
+    const { config, records, trend } = analyzeMachineHistory(database, machine.id);
+    const candidates = evaluateEarlyWarnings(records, trend, config);
+    const persistedWarnings = candidates.map((candidate) =>
+      upsertEarlyWarning(database, machine.id, candidate),
+    );
+    const publicTrend = publicTrendResult(trend);
+    const trendChanged =
+      previousTrend &&
+      (previousTrend.trend_classification !== trend.trend_classification ||
+        previousTrend.risk_classification !== trend.risk_classification ||
+        (previousTrend.valid_observations < config.minimumObservations &&
+          trend.valid_observations >= config.minimumObservations));
+    if (trendChanged) {
+      broadcast({
+        type: "trend_update",
+        machineId: machine.id,
+        machineLabel: cameraLabel,
+        trend: publicTrend,
+      });
+    }
+    for (const persistedWarning of persistedWarnings) {
+      if (persistedWarning.created) {
+        broadcast({
+          type: "early_warning",
+          machineId: machine.id,
+          machineLabel: cameraLabel,
+          warning: warningResponse(persistedWarning.warning),
+        });
+      }
+    }
+  } catch (error) {
+    console.error("Could not update machine trend/warning intelligence:", error);
+  }
+  try {
+    const fused = fuseMachineContext(getDatabase(), machine.id);
+    if (fused) {
+      broadcast({
+        type: "sensor_fusion_update",
+        machineId: machine.id,
+        fusion: fused.fusion,
+      });
+      for (const incidentResult of fused.incidentResults) {
+        if (incidentResult.created) {
+          broadcast({
+            type: "sensor_incident_created",
+            machineId: machine.id,
+            incident: incidentResult.incident,
+          });
+        } else if (incidentResult.severityChanged) {
+          broadcast({
+            type: "sensor_incident_updated",
+            machineId: machine.id,
+            incident: incidentResult.incident,
+          });
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Could not fuse camera analysis with sensor intelligence:", error);
+  }
+  if (activeJob) {
+    try {
+      const database = getDatabase();
+      const currentJob = getJob(database, activeJob.id);
+      if (currentJob && ["RUNNING", "PAUSED"].includes(currentJob.status)) {
+        const candidates = detectJobDeviations(
+          currentJob,
+          getJobAnalysisHistoryForInsights(database, currentJob.id),
+        );
+        for (const deviation of persistJobDeviations(database, currentJob.id, candidates)) {
+          if (deviation.created || deviation.severityChanged) {
+            broadcast({
+              type: "job_deviation",
+              machineId: currentJob.machine_id,
+              jobId: currentJob.id,
+              deviation,
+            });
+          }
+        }
+      }
+    } catch (error) {
+      console.error("Could not update job deviation intelligence:", error);
+    }
+  }
+}
 const confirmation = updateConfirmation(cameraId, normalized);
 const payload = {
 ...normalized,
 ...confirmation,
 latency_ms: latencyMs,
 camera_id: cameraId,
+machine_id: machine?.id || null,
+job_id: activeJob?.id || null,
+};
+const livePayload = {
+...normalized,
+...confirmation,
+latency_ms: latencyMs,
+camera_id: cameraId,
+job_id: activeJob?.id || null,
 };
 response.json(payload);
-broadcast({ type: "status_update", cameraId, cameraLabel, result: payload });
+broadcast({ type: "status_update", cameraId, cameraLabel, result: livePayload });
 if (confirmation.newly_confirmed) {
 console.log(`Confirmed failure on "${cameraLabel}": ${normalized.failure_type}`);
 notifyFailure({
@@ -1067,7 +2714,7 @@ key: `pause:${cameraId}`,
 });
 }
 });
-broadcast({ type: "failure_confirmed", cameraId, cameraLabel, result: payload });
+broadcast({ type: "failure_confirmed", cameraId, cameraLabel, result: livePayload });
 markAlerted(cameraId, normalized);
 } else if (confirmation.newly_recovered) {
 console.log(`"${cameraLabel}" recovered: ${normalized.machine_status}`);
@@ -1102,6 +2749,10 @@ notifyRoutine({ cameraId, cameraLabel, result: payload });
 const failedCameraLabel = clean(request.body?.cameraLabel, 100) || "unknown camera";
 const providerLabel = provider === "openrouter" ? "OpenRouter" : "Groq";
 if (error?.invalidJson) {
+recordInvalidAttempt({
+  reason: `${providerLabel} returned malformed or unparseable analysis JSON.`,
+  errorCategory: "malformed_response",
+});
 notifyError({
 scope: "analysis",
 message: `${providerLabel} returned unparseable JSON for "${failedCameraLabel}". Monitoring is not producing results.`,
@@ -1115,122 +2766,168 @@ code: "invalid_json",
 details: (error.rawText || "").slice(0, 500),
 });
 }
-console.error(`FULL ${providerLabel.toUpperCase()} ERROR:`, error);
-const status = Number(error?.status) || 500;
-const details =
-error?.error?.error?.message ||
-error?.error?.message ||
-error?.message ||
-`Unknown ${providerLabel} API error.`;
-const messages = {
-400: `${providerLabel} rejected the request format.`,
-401: `${providerLabel} rejected the API key. Please check your key.`,
-402: "OpenRouter account balance is insufficient. Please top up credits at openrouter.ai/credits.",
-403: `This account cannot use the selected model: ${model}.`,
-404: `${providerLabel} could not find the model: ${model}`,
-413: "The image request is too large for the model limits.",
-422: `${providerLabel} could not produce valid JSON. Try again.`,
-429: `${providerLabel} token or rate limit reached. Please wait a moment.`,
-500: `${providerLabel} experienced an internal error.`,
-502: `${providerLabel} returned an invalid response.`,
-503: `${providerLabel} is temporarily unavailable.`,
-};
-const summary = messages[status] || `${providerLabel} request failed with status ${status}.`;
+const failure = classifyProviderError(error, {
+  provider: providerLabel,
+  model,
+  secrets: [groqApiKey, openrouterApiKey],
+});
+recordInvalidAttempt({
+  reason: failure.providerMessage,
+  errorCategory: failure.code,
+});
+console.error("[ai-request] Provider call failed.", {
+  provider: providerLabel,
+  model,
+  status: failure.status,
+  code: failure.code,
+  message: failure.providerMessage,
+});
 notifyError({
 scope: "analysis",
-message: `${summary} Monitoring on "${failedCameraLabel}" is not producing results.`,
-details,
+message: `${failure.message} Monitoring on "${failedCameraLabel}" is not producing results.`,
+details: failure.providerMessage,
 cameraLabel: failedCameraLabel,
-key: `analyze:${status}`,
+key: `analyze:${failure.code}:${failure.status || "unknown"}`,
 });
-response.status(status).json({
-error: summary,
-details,
+response.status(failure.status || 500).json({
+error: failure.message,
+code: failure.code,
+provider_status: failure.status,
+provider,
+model,
+details: failure.providerMessage,
 });
 }
+} catch (error) {
+  console.error("Unexpected analysis pipeline error:", error);
+  response.status(500).json({
+    error: "The analysis could not be completed.",
+    code: "analysis_internal_error",
+  });
+}
 });
-// Errors that escape a request handler would otherwise only reach the terminal
-// — which is exactly what nobody is watching when a print fails overnight.
-process.on("unhandledRejection", (reason) => {
-console.error("UNHANDLED REJECTION:", reason);
-notifyError({
-scope: "server",
-message: "An unhandled promise rejection occurred. Monitoring may be degraded.",
-details: String(reason?.stack || reason?.message || reason),
-key: "server:unhandled_rejection",
-});
-});
+function registerProcessHandlers() {
+  if (processHandlersRegistered) return;
+  processHandlersRegistered = true;
 
-process.on("uncaughtException", async (error) => {
-console.error("UNCAUGHT EXCEPTION:", error);
-notifyError({
-scope: "server",
-message: "Watch Guard crashed. Monitoring has stopped and the machine is unwatched.",
-details: String(error?.stack || error?.message || error),
-key: "server:uncaught_exception",
-fatal: true,
-});
-// Node's default behaviour with no handler installed is to exit; keep that,
-// but give the alert a moment to leave first.
-await flushNotifications();
-process.exit(1);
-});
+  process.on("unhandledRejection", (reason) => {
+    console.error("UNHANDLED REJECTION:", reason);
+    notifyError({
+      scope: "server",
+      message: "An unhandled promise rejection occurred. Monitoring may be degraded.",
+      details: String(reason?.stack || reason?.message || reason),
+      key: "server:unhandled_rejection",
+    });
+  });
 
-// Express 5 runs an app.listen(port, callback) callback even when the bind
-// fails, which would print "Watch Guard is running" over a failed start. The
-// "listening" event only fires on a real bind, so the banner hangs off that.
-const server = app.listen(port);
-server.on("listening", () => {
-const notifications = describeNotifications();
-console.log(`Watch Guard is running at http://localhost:${port}`);
-const hasActiveKey = provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groq);
-console.log(`Provider: ${provider === "openrouter" ? "OpenRouter" : "Groq"} | Model: ${model}`);
-console.log(
-hasActiveKey
-? `${provider === "openrouter" ? "OpenRouter" : "Groq"} API key loaded.`
-: `No API key yet — open the app to configure or add OPENROUTER_API_KEY in .env.`,
-);
-if (notifications.configured) {
-console.log("Discord alerts enabled (confirmed failures, recoveries, and errors).");
-if (/^(1|true|yes|on)$/i.test(String(process.env.DISCORD_NOTIFY_STARTUP || "").trim())) {
-notifyInfo({
-title: "🟢 Watch Guard online",
-message: `Monitoring backend started on port ${port} using ${model}.`,
-});
+  process.on("uncaughtException", async (error) => {
+    console.error("UNCAUGHT EXCEPTION:", error);
+    notifyError({
+      scope: "server",
+      message: "Watch Guard crashed. Monitoring has stopped and the machine is unwatched.",
+      details: String(error?.stack || error?.message || error),
+      key: "server:uncaught_exception",
+      fatal: true,
+    });
+    await flushNotifications();
+    process.exit(1);
+  });
 }
-} else if (notifications.invalidUrl) {
-console.warn(
-"DISCORD_WEBHOOK_URL is set but is not a valid Discord webhook URL — alerts are disabled.",
-);
-} else {
-console.log("Discord alerts disabled — set DISCORD_WEBHOOK_URL in .env to enable them.");
-}
-});
-// A failure to bind is a startup problem, not a monitoring outage, so it must
-// not fire the "the machine is unwatched" crash alert — the usual cause is a
-// second `npm start` while the first one is still running and watching fine.
-server.on("error", async (error) => {
-if (error?.code === "EADDRINUSE") {
-console.error(
-`\nPort ${port} is already in use — Watch Guard is probably already running.\n` +
-`Open http://localhost:${port} in your browser, or close the other terminal\n` +
-`window first. To run a second copy on another port: PORT=${port + 1} npm start\n`,
-);
-process.exit(1);
-}
-console.error("Watch Guard could not start:", error);
-await notifyError({
-scope: "startup",
-message: `Watch Guard could not start on port ${port}, so nothing is being monitored.`,
-details: String(error?.stack || error?.message || error),
-key: "server:listen_error",
-fatal: true,
-});
-await flushNotifications();
-process.exit(1);
-});
 
-wss = new WebSocketServer({ server });
-wss.on("connection", (socket) => {
-socket.send(JSON.stringify({ type: "hello", message: "Connected to Watch Guard live updates." }));
-});
+export async function startServer({ listenPort = port } = {}) {
+  const database = initializeDatabase();
+  simulationService.restoreRunningSessions();
+  registerProcessHandlers();
+
+  const server = app.listen(listenPort);
+  if (sensorHealthTimer) clearInterval(sensorHealthTimer);
+  const healthConfig = getSensorFusionConfig();
+  const healthPollMs = Math.max(5_000, Math.min(60_000, Number(process.env.SENSOR_HEALTH_POLL_MS) || 15_000));
+  const healthTimer = setInterval(() => {
+    try {
+      const sensors = listSensors(database, {
+        staleAfterMs: healthConfig.staleAfterMs,
+        disconnectedAfterMs: healthConfig.disconnectedAfterMs,
+      });
+      for (const sensor of sensors) {
+        if (!sensor.health_changed) continue;
+        broadcast({
+          type: "sensor_health_update",
+          machineId: sensor.machine_id,
+          sensor: {
+            id: sensor.id,
+            health_status: sensor.health_status,
+            last_seen_at: sensor.last_seen_at,
+          },
+        });
+      }
+    } catch (error) {
+      console.error("Could not refresh sensor health status:", error);
+    }
+  }, healthPollMs);
+  healthTimer.unref();
+  sensorHealthTimer = healthTimer;
+  server.once("close", () => {
+    clearInterval(healthTimer);
+    simulationService.stopTimers();
+    if (sensorHealthTimer === healthTimer) {
+      sensorHealthTimer = null;
+    }
+  });
+  server.on("listening", () => {
+    const notifications = describeNotifications();
+    console.log(`Watch Guard is running at http://localhost:${listenPort}`);
+    const hasActiveKey = provider === "openrouter" ? Boolean(openrouterApiKey) : Boolean(groq);
+    console.log(`Provider: ${provider === "openrouter" ? "OpenRouter" : "Groq"} | Model: ${model}`);
+    console.log(
+      hasActiveKey
+        ? `${provider === "openrouter" ? "OpenRouter" : "Groq"} API key loaded.`
+        : "No API key yet — open the app to configure or add OPENROUTER_API_KEY in .env.",
+    );
+    if (notifications.configured) {
+      console.log("Discord alerts enabled (confirmed failures, recoveries, and errors).");
+      if (/^(1|true|yes|on)$/i.test(String(process.env.DISCORD_NOTIFY_STARTUP || "").trim())) {
+        notifyInfo({
+          title: "🟢 Watch Guard online",
+          message: `Monitoring backend started on port ${listenPort} using ${model}.`,
+        });
+      }
+    } else if (notifications.invalidUrl) {
+      console.warn("DISCORD_WEBHOOK_URL is set but is not a valid Discord webhook URL — alerts are disabled.");
+    } else {
+      console.log("Discord alerts disabled — set DISCORD_WEBHOOK_URL in .env to enable them.");
+    }
+  });
+  server.on("error", async (error) => {
+    if (error?.code === "EADDRINUSE") {
+      console.error(
+        `\nPort ${listenPort} is already in use — Watch Guard is probably already running.\n` +
+          `Open http://localhost:${listenPort} in your browser, or close the other terminal\n` +
+          `window first. To run a second copy on another port: PORT=${listenPort + 1} npm start\n`,
+      );
+      process.exit(1);
+    }
+    console.error("Watch Guard could not start:", error);
+    await notifyError({
+      scope: "startup",
+      message: `Watch Guard could not start on port ${listenPort}, so nothing is being monitored.`,
+      details: String(error?.stack || error?.message || error),
+      key: "server:listen_error",
+      fatal: true,
+    });
+    await flushNotifications();
+    process.exit(1);
+  });
+
+  wss = new WebSocketServer({ server });
+  wss.on("connection", (socket) => {
+    socket.send(JSON.stringify({ type: "hello", message: "Connected to Watch Guard live updates." }));
+  });
+  return server;
+}
+
+export { app };
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))) {
+  await startServer();
+}
